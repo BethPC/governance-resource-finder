@@ -1,7 +1,10 @@
 import os
+import re
 import time
 from collections import deque
+from urllib.parse import urlparse
 
+import requests
 import streamlit as st
 from openai import OpenAI
 
@@ -89,7 +92,7 @@ if len(mlo or "") > MAX_CHARS or len(constraints or "") > MAX_CHARS:
     st.stop()
 
 # ----------------------------
-# System prompt (Resources-first + Student Reading; Streamlit-optimized table)
+# System prompt (Resources-first + Student Reading; Streamlit-optimized table + URL rules)
 # ----------------------------
 SYSTEM_PROMPT = """
 You are Governance Resource Finder, an AI research assistant for instructional designers building courses on government, sustainability, smart cities, and digital living infrastructure. Your purpose is to find, vet, and summarize open or freely accessible learning resources—NOT to teach or explain the topic yourself.
@@ -113,6 +116,12 @@ Rules for Behavior
 - Prefer open-licensed (CC BY/CC BY-NC/open access); accept freely accessible (no paywall) if reputable. Exclude paywalled, login-restricted, unreliable sources.
 - Include at least one dataset/visual and one applied case when possible.
 - Default recency: 2019+ unless canonical.
+
+URL Reliability Rules:
+- Only include links that are likely valid and currently accessible (avoid 404s and generic homepages).
+- Link to the specific resource page when possible (not just the domain root).
+- Prefer direct links to PDFs or official report pages when available.
+- If you cannot provide a reliable specific link, write: “(no stable open URL; available via [Organization Name] publications)”.
 
 Output Format (Streamlit-optimized)
 A. Acknowledgement & Search Plan — one short line (keywords + domains).
@@ -146,7 +155,7 @@ if run:
         st.warning("You’ve hit the session limit (15 runs/hour). Please try again later.")
         st.stop()
 
-    api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+    api_key = os.environ.get("OPENAI_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
     if not api_key:
         st.error("OPENAI_API_KEY not found. Add it in Streamlit Secrets.")
         st.stop()
@@ -172,5 +181,76 @@ if run:
     # Count only successful runs
     record_session_run()
 
-    # Render the response (tables & links render nicely in Streamlit markdown)
+    # Render the response
     st.markdown(content)
+
+    # ----------------------------
+    # Link Verification Report (lightweight)
+    # ----------------------------
+    # Extract URLs from raw content: handles plain URLs and Markdown [text](url)
+    raw_urls = set()
+    # Plain URLs
+    raw_urls.update(re.findall(r"https?://[^\s)>\]]+", content))
+    # Markdown link targets
+    raw_urls.update(re.findall(r"\((https?://[^)]+)\)", content))
+
+    # Sanitize and dedupe (limit to a reasonable number to keep the app snappy)
+    cleaned_urls = []
+    seen = set()
+    for u in raw_urls:
+        # Trim trailing punctuation
+        u = u.strip().rstrip(".,);]")
+        # Skip obviously bad URLs
+        try:
+            parsed = urlparse(u)
+            if not parsed.scheme.startswith("http"):
+                continue
+        except Exception:
+            continue
+        if u not in seen:
+            seen.add(u)
+            cleaned_urls.append(u)
+        if len(cleaned_urls) >= 20:  # cap verification to 20 links per run
+            break
+
+    if cleaned_urls:
+        st.markdown("### 🔍 Link Verification Report")
+        st.caption("Checks whether each URL responds (HEAD with redirects, then GET fallback if needed).")
+        good, warn, bad = [], [], []
+
+        for url in cleaned_urls:
+            status = None
+            try:
+                # Some sites block HEAD; allow redirects
+                r = requests.head(url, timeout=6, allow_redirects=True)
+                status = r.status_code
+                # Fallback to GET if HEAD is not helpful (e.g., 405/403)
+                if status in (403, 405) or status >= 500:
+                    r2 = requests.get(url, timeout=8, allow_redirects=True, stream=True)
+                    status = r2.status_code
+            except Exception as e:
+                status = f"error: {e.__class__.__name__}"
+
+            if isinstance(status, int) and 200 <= status < 300:
+                good.append((url, status))
+            elif isinstance(status, int) and 300 <= status < 400:
+                warn.append((url, f"{status} (redirect)"))
+            elif isinstance(status, int):
+                bad.append((url, status))
+            else:
+                bad.append((url, status))
+
+        if good:
+            st.success("Working:")
+            for url, s in good:
+                st.write(f"✅ {s} — {url}")
+        if warn:
+            st.warning("Redirects (likely OK, verify content):")
+            for url, s in warn:
+                st.write(f"⚠️ {s} — {url}")
+        if bad:
+            st.error("Broken or blocked:")
+            for url, s in bad:
+                st.write(f"❌ {s} — {url}")
+
+        st.caption("Tip: If a link is broken, try the organization’s publications page and search the exact report title.")
