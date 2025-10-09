@@ -71,6 +71,7 @@ with st.sidebar:
     )
     temperature = st.slider("Creativity (lower = stricter)", 0.0, 1.0, 0.2, 0.1)
     model = st.selectbox("Model", ["gpt-4o", "gpt-4o-mini"], index=0)
+    show_diag = st.checkbox("Show diagnostics (attempts & broken links)", value=False)
 
 # ----------------------------
 # Inputs
@@ -151,7 +152,7 @@ Aim for a total of 6–8 working resource URLs in section E.
 # Helpers: model call & link verification
 # ----------------------------
 def call_model(mlo_text: str, constraints_text: str, prior_content: str | None = None) -> str:
-    """Call the model. If prior_content is provided, this is a retry asking for replacements."""
+    """Call the model. If prior_content is provided, this is a retry or targeted rebuild."""
     api_key = os.environ.get("OPENAI_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
     if not api_key:
         st.error("OPENAI_API_KEY not found. Add it in Streamlit Secrets.")
@@ -161,7 +162,6 @@ def call_model(mlo_text: str, constraints_text: str, prior_content: str | None =
     messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
     if prior_content:
         messages.append({"role": "assistant", "content": prior_content})
-        messages.append({"role": "user", "content": RETRY_USER_INSTRUCTION})
     else:
         user_msg = f"Module-level objective (MLO): {mlo_text}\nOptional constraints: {constraints_text or 'None'}"
         messages.append({"role": "user", "content": user_msg})
@@ -212,7 +212,7 @@ def check_url(url: str, head_timeout=6, get_timeout=8) -> tuple[bool, str]:
         return False, f"error: {e.__class__.__name__}"
 
 # ----------------------------
-# Run button
+# Run button (clean output by default; diagnostics optional)
 # ----------------------------
 run = st.button("Find resources", type="primary")
 
@@ -221,66 +221,98 @@ if run:
         st.warning("Please paste the module objective first.")
         st.stop()
 
-    # Per-session throttle
     if not allow_session_run():
         st.warning("You’ve hit the session limit (15 runs/hour). Please try again later.")
         st.stop()
 
     record_session_run()
 
-    # First attempt
+    # === 1) First generation ===
     with st.spinner("Generating draft and checking links…"):
-        content = call_model(mlo, constraints)
-        st.markdown(content)
+        draft_content = call_model(mlo, constraints)
 
-        urls = extract_urls(content, cap=50)
-        results = [(u, *check_url(u)) for u in urls]
+    # Diagnostics: show raw draft if requested
+    if show_diag:
+        with st.expander("Diagnostics: raw draft"):
+            st.markdown(draft_content)
 
-        good = [u for (u, ok, note) in results if ok]
-        bad = [(u, note) for (u, ok, note) in results if not ok]
+    # === 2) Verify URLs and retry if needed ===
+    urls = extract_urls(draft_content, cap=50)
+    results = [(u, *check_url(u)) for u in urls]
+    good = [u for (u, ok, note) in results if ok]
+    bad = [(u, note) for (u, ok, note) in results if not ok]
 
-        # Retry loop: ask model to replace broken links and re-output the table/leads
-        MAX_RETRIES = 2
-        attempt = 0
-        while len(good) < 6 and attempt < MAX_RETRIES:
-            attempt += 1
-            st.info(f"Attempt {attempt}: replacing broken/generic links and retrying sections E & G…")
-            retry_content = call_model(mlo, constraints, prior_content=content)
-            # Show what changed
-            st.markdown(retry_content)
+    MAX_RETRIES = 2
+    attempt = 0
+    retry_chunks = []
 
-            # Merge sections by simple concatenation (display-wise it’s fine)
-            content += "\n\n" + retry_content
+    content_for_context = draft_content
+    while len(good) < 6 and attempt < MAX_RETRIES:
+        attempt += 1
+        retry_chunk = call_model(mlo, constraints, prior_content=content_for_context + "\n\n" + RETRY_USER_INSTRUCTION)
+        retry_chunks.append((attempt, retry_chunk))
+        content_for_context += "\n\n" + retry_chunk
 
-            # Re-verify with the combined text
-            urls = extract_urls(retry_content, cap=50)
-            results = [(u, *check_url(u)) for u in urls]
-            good.extend([u for (u, ok, note) in results if ok and u not in good])
+        urls_new = extract_urls(retry_chunk, cap=50)
+        results_new = [(u, *check_url(u)) for u in urls_new]
+        for (u, ok, _) in results_new:
+            if ok and u not in good:
+                good.append(u)
 
-        # Final verification report
-        all_urls = extract_urls(content, cap=100)
-        final_results = [(u, *check_url(u)) for u in all_urls]
-        good_final = [(u, note) for (u, ok, note) in final_results if ok]
-        bad_final = [(u, note) for (u, ok, note) in final_results if not ok]
+    # Diagnostics: show attempts + verification if requested
+    if show_diag:
+        with st.expander("Diagnostics: attempts & verification"):
+            for (i, chunk) in retry_chunks:
+                st.info(f"Attempt {i}: replacing broken/generic links and retrying sections E & G…")
+                st.markdown(chunk)
 
-    # ----------------------------
-    # Link Verification Report
-    # ----------------------------
-    st.markdown("### 🔍 Link Verification Report")
-    st.caption("Checks whether each URL responds (HEAD with redirects, then GET fallback).")
-    if good_final:
-        st.success("Working:")
-        for url, note in good_final:
-            st.write(f"✅ {note} — {url}")
-    if bad_final:
-        st.error("Broken or blocked:")
-        for url, note in bad_final:
-            st.write(f"❌ {note} — {url}")
+            all_urls = extract_urls(content_for_context, cap=100)
+            final_results = [(u, *check_url(u)) for u in all_urls]
+            good_final = [(u, note) for (u, ok, note) in final_results if ok]
+            bad_final = [(u, note) for (u, ok, note) in final_results if not ok]
 
-    # Explain if still short on valid links
-    valid_count = len({u for u, _ in good_final})
-    if valid_count < 6:
+            st.markdown("### 🔍 Link Verification Report")
+            st.caption("Checks whether each URL responds (HEAD with redirects, then GET fallback).")
+            if good_final:
+                st.success("Working:")
+                for url, note in good_final:
+                    st.write(f"✅ {note} — {url}")
+            if bad_final:
+                st.error("Broken or blocked:")
+                for url, note in bad_final:
+                    st.write(f"❌ {note} — {url}")
+
+    # === 3) Rebuild a CLEAN Section E using only verified URLs ===
+    good_unique = list(dict.fromkeys(good))  # de-dupe, keep order
+    verified_summary_list = "\n".join(f"- {u}" for u in good_unique) if good_unique else "- (none)"
+
+    rebuild_instruction = f"""
+Rebuild ONLY section E (Resource Table) using EXACTLY and ONLY these verified URLs (use official titles/metadata if inferable; otherwise concise titles). Preserve the same Markdown table columns and formatting.
+
+Verified URLs:
+{verified_summary_list}
+"""
+    clean_section_e = call_model(mlo, constraints, prior_content=rebuild_instruction)
+
+    # === 4) Rebuild sections A–D (short) and F; exclude E & G here ===
+    adf_instruction = "Re-output sections A–D (short) and F only. Do not include sections E or G."
+    clean_adf = call_model(mlo, constraints, prior_content=adf_instruction)
+
+    # === 5) Rebuild section G (Optional Leads) as required ===
+    leads_instruction = """
+Re-output ONLY section G (Optional Leads). If you cannot confidently name 2–3 paywalled/restricted items with short value notes, output exactly:
+"No suitable paywalled leads found; open sources cover the scope."
+"""
+    clean_section_g = call_model(mlo, constraints, prior_content=leads_instruction)
+
+    # === 6) Final clean presentation ===
+    st.markdown("## Final Output")
+    st.markdown(clean_adf)
+    st.markdown(clean_section_e)
+    st.markdown(clean_section_g)
+
+    if len(good_unique) < 6:
         st.warning(
-            f"Only {valid_count} verified links were found after retries. "
+            f"Only {len(good_unique)} verified links were available. "
             "Consider narrowing the topic, relaxing recency, or allowing reputable media sources."
         )
