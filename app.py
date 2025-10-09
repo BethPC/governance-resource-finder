@@ -16,13 +16,6 @@ st.set_page_config(page_title="Governance Resource Finder", page_icon="📚", la
 st.title("📚 Governance Resource Finder (Open / Freely Accessible)")
 st.caption("Paste a module-level learning objective (MLO). Optionally add constraints (region, media type, recency, exclusions).")
 
-# Quick reset to clear all session state
-with st.sidebar:
-    if st.button("Reset app"):
-        st.session_state.clear()
-        st.success("App state cleared.")
-        st.rerun()
-
 # ----------------------------
 # Passcode gate (passcode must be in Streamlit Secrets)
 # ----------------------------
@@ -82,7 +75,7 @@ with st.sidebar:
     show_diag = st.checkbox("Show diagnostics (attempts & broken links)", value=False)
 
 # ----------------------------
-# Inputs (no topical examples)
+# Inputs (neutral placeholders)
 # ----------------------------
 mlo = st.text_area(
     "Module-level objective (MLO)",
@@ -91,7 +84,7 @@ mlo = st.text_area(
 )
 constraints = st.text_area(
     "Optional constraints",
-    placeholder="e.g., Region: global; Recency: since 2010; Media: datasets + policy briefs; Exclusions: blogs"
+    placeholder="e.g., Region: global; Recency: since 2010; Media: datasets + policy briefs + educational videos; Exclusions: blogs"
 )
 
 # Guard against giant inputs
@@ -124,10 +117,11 @@ Mission (resources-first)
 Rules for Behavior
 - You are a librarian, not an instructor; never fulfill/teach the objective.
 - Every factual claim must come from cited materials.
-- Preferred domains: .gov, .edu, .org; IGOs/NGOs (e.g., UN, World Bank, OECD, WHO); university OER; open datasets (e.g., Data.gov, Our World in Data, World Bank Data, OECD Stats); reputable legacy media only if freely viewable.
+- Preferred domains: .gov, .edu, .org; IGOs/NGOs (e.g., UN, World Bank, OECD, WHO); university OER; open datasets (e.g., Data.gov, Our World in Data, World Bank Data, OECD Stats).
+- Reputable media and educational video sources are allowed if freely viewable (e.g., legacy outlets with strong editorial standards; official org YouTube channels like UN/OECD/World Bank/universities; established explainer channels).
 - Prefer open-licensed or open access; accept freely accessible (no paywall) if reputable.
 - Include at least one dataset/visual and one applied case when possible.
-- Default recency: 2019+ unless canonical.
+- Default recency: 2010+ unless a canonical/legacy source is clearly warranted.
 - IMPORTANT: Include **hyperlinks only in Section E** (Resource Table). In all other sections (A–D, F, G), refer to resources by title/domain only—no links.
 
 URL Reliability Rules
@@ -387,5 +381,5 @@ if run:
     if len(good_unique) < 6:
         st.warning(
             f"Only {len(good_unique)} verified links were available. "
-            "Consider narrowing the topic, relaxing recency, or allowing reputable media sources."
+            "Consider narrowing the topic, relaxing constraints further, or allowing more media types."
         )
