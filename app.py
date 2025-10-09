@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 from collections import deque
 from urllib.parse import urlparse
@@ -45,7 +46,7 @@ if not st.session_state.authed:
 # ----------------------------
 # Gentle per-session rate limit (15 runs per rolling hour)
 # ----------------------------
-WINDOW_SECONDS = 3600     # 1 hour rolling window
+WINDOW_SECONDS = 3600     # 1 hour
 MAX_RUNS_PER_WINDOW = 15  # per browser session
 
 if "run_stamps" not in st.session_state:
@@ -93,7 +94,7 @@ if len(mlo or "") > MAX_CHARS or len(constraints or "") > MAX_CHARS:
     st.stop()
 
 # ----------------------------
-# System prompt (Resources-first + Student Reading; table + URL rules)
+# System prompt (resources-first; no links outside E)
 # ----------------------------
 BASE_SYSTEM_PROMPT = """
 You are Governance Resource Finder, an AI research assistant for instructional designers building courses on government, sustainability, smart cities, and digital living infrastructure. Your purpose is to find, vet, and summarize open or freely accessible learning resources—NOT to teach or explain the topic yourself.
@@ -113,66 +114,56 @@ Mission (resources-first)
 Rules for Behavior
 - You are a librarian, not an instructor; never fulfill/teach the objective.
 - Every factual claim must come from cited materials.
-- Preferred domains (in order): .gov, .edu, .org; IGOs/NGOs (UN, World Bank, OECD, WHO, UN-Habitat); university OER portals (OpenStax, MIT OCW, Harvard, Stanford); open datasets (Data.gov, Our World in Data, World Bank Data, OECD Stats); reputable legacy media only if freely viewable (NYT/WaPo/Guardian/TOI/China Daily).
-- Prefer open-licensed (CC BY/CC BY-NC/open access); accept freely accessible (no paywall) if reputable. Exclude paywalled, login-restricted, unreliable sources.
+- Preferred domains (in order): .gov, .edu, .org; IGOs/NGOs (UN, World Bank, OECD, WHO, UN-Habitat); university OER portals; open datasets (Data.gov, OWID, World Bank Data, OECD Stats); reputable legacy media only if freely viewable.
+- Prefer open-licensed or open access; accept freely accessible (no paywall) if reputable.
 - Include at least one dataset/visual and one applied case when possible.
 - Default recency: 2019+ unless canonical.
+- IMPORTANT: Include **hyperlinks only in Section E** (Resource Table). In all other sections (A–D, F, G), refer to resources by title/domain only—no links.
 
-URL Reliability Rules:
-- Provide specific resource URLs (not just homepages). Prefer official report pages or direct open PDFs.
-- Do not fabricate paths. If you are not certain of a specific URL, write: “(no stable open URL; available via [Organization Name] publications)”.
-- Aim for at least 6–8 sources whose URLs are likely to resolve (no 404s).
+URL Reliability Rules
+- Provide specific resource URLs (not homepages) in Section E.
+- Do not fabricate paths; if unknown, say “(no stable open URL; available via [Organization])”.
+- Aim for 6–8 sources that are likely to resolve (no 404s).
 
-Output Format (Streamlit-optimized)
+Output Format
 A. Acknowledgement & Search Plan — one short line (keywords + domains).
-B. Resource Overview (Themes) — 2–4 bullets with short inline citations.
-C. Provisional ELOs (derived from resources) — 2–4 measurable statements; after each, include 1–2 anchor citations.
-D. Executive Summary (Top Resources per ELO) — bullets mapping 2–3 items per ELO with 1-line rationales.
-E. Resource Table — render the main list as a Markdown table using embedded links for URLs (Markdown `[title](url)` format). Use exactly these columns and keep each resource to a single row:
+B. Resource Overview (Themes) — 2–4 bullets with concise inline source attributions (no links).
+C. Provisional ELOs (derived from resources) — 2–4 measurable statements; include short anchor attributions (no links).
+D. Executive Summary (Top Resources per ELO) — bullets mapping 2–3 items per ELO with 1-line rationales (no links).
+F. Student Reading (≤ 10 pages) — pick one item from Section E by title, and justify in 50–80 words. Do not add new links here.
 
-| Title | Type | Year | Access Type | Why it aligns | Suggested Use | URL |
-|-------|------|------|------------|---------------|---------------|-----|
-| Example: Ofcom – Online Nation | Regulator report | 2023 | Freely accessible | Independent data on home device usage and streaming patterns | Pre-read | [Link](https://www.ofcom.org.uk/research-and-data/media-literacy-research/online-nation) |
-
-F. Student Reading (≤ 10 pages) — citation, URL (as Markdown link), access type, approx. length/page count, and a 50–80 word rationale explaining why it’s a clear, accessible introduction for non-specialists.
-G. Optional Leads (paywalled or restricted) — provide 2–3 if available, each with a one-line note on value; if none exist, write a single line: “No suitable paywalled leads found; open sources cover the scope.”
+(Section E and how it will be built is handled later.)
+G. Optional Leads (paywalled or restricted) — provide 2–3 titles with domain names and value notes; if none exist, output exactly: “No suitable paywalled leads found; open sources cover the scope.”
 """
 
-# A helper instruction used only on retries:
 RETRY_USER_INSTRUCTION = """
-Some URLs above appear invalid or generic. Replace any broken or generic links with valid, specific URLs to the cited resources.
-Re-output ONLY sections:
-E. Resource Table
-G. Optional Leads (paywalled or restricted)
-Keep the exact table columns and the same Markdown formatting as before.
-Aim for a total of 6–8 working resource URLs in section E.
+Some links look invalid or generic. Replace any broken or generic links with valid, specific URLs to the cited resources.
+Re-output ONLY the Resource Table (you may show it as a Markdown table) and the Optional Leads section.
+Aim for a total of 6–8 working resource URLs.
 """
 
 # ----------------------------
 # Helpers: model call & link verification
 # ----------------------------
-def call_model(mlo_text: str, constraints_text: str, prior_content: str | None = None) -> str:
-    """Call the model. If prior_content is provided, this is a retry or targeted rebuild."""
-    api_key = os.environ.get("OPENAI_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+def get_client() -> OpenAI:
+    api_key = (
+        os.environ.get("OPENAI_OPENAI_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or st.secrets.get("OPENAI_API_KEY")
+    )
     if not api_key:
         st.error("OPENAI_API_KEY not found. Add it in Streamlit Secrets.")
         st.stop()
-    client = OpenAI(api_key=api_key)
+    return OpenAI(api_key=api_key)
 
-    messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
-    if prior_content:
-        messages.append({"role": "assistant", "content": prior_content})
-    else:
-        user_msg = f"Module-level objective (MLO): {mlo_text}\nOptional constraints: {constraints_text or 'None'}"
-        messages.append({"role": "user", "content": user_msg})
-
+def call_model(messages: list[dict], temperature: float) -> str:
+    client = get_client()
     resp = client.chat.completions.create(
         model=model,
         temperature=temperature,
         messages=messages
     )
     return resp.choices[0].message.content
-
 
 def extract_urls(markdown_text: str, cap: int = 50) -> list[str]:
     raw_urls = set()
@@ -194,9 +185,7 @@ def extract_urls(markdown_text: str, cap: int = 50) -> list[str]:
             break
     return cleaned
 
-
 def check_url(url: str, head_timeout=6, get_timeout=8) -> tuple[bool, str]:
-    """Return (ok, note), where ok=True means a likely good link."""
     try:
         r = requests.head(url, timeout=head_timeout, allow_redirects=True)
         code = r.status_code
@@ -210,6 +199,65 @@ def check_url(url: str, head_timeout=6, get_timeout=8) -> tuple[bool, str]:
         return False, f"{code}"
     except Exception as e:
         return False, f"error: {e.__class__.__name__}"
+
+def build_metadata_json(verified_urls: list[str]) -> list[dict]:
+    """
+    Ask the model for metadata for each verified URL and return a parsed JSON list.
+    URLs must be echoed exactly; we render the table ourselves to avoid any URL changes.
+    """
+    if not verified_urls:
+        return []
+
+    verified_list = "\n".join(f"- {u}" for u in verified_urls)
+    messages = [
+        {"role": "system", "content": "You output strict JSON only. No prose. No markdown. UTF-8."},
+        {"role": "user", "content": f"""
+Given these verified URLs, return a JSON array where each item has exactly:
+"title" (string),
+"type" (one of ["Report","Dataset","Web page","Policy brief","Video","Overview","Academic article"]),
+"year" (integer or null),
+"access" (one of ["Open access","Open-licensed","Freely accessible"]),
+"why_aligns" (string, <= 2 sentences),
+"use" (one of ["Core reading","Supplementary reading","Pre-read","Dataset exercise","Case anchor","Video primer"]),
+"url" (string, MUST EXACTLY match one of the provided URLs).
+
+Use official titles if recognizable; otherwise concise accurate titles. Do NOT invent URLs. Keep the list order similar to input.
+
+Verified URLs:
+{verified_list}
+"""}]
+    content = call_model(messages, temperature=0.1)
+    # Strip code fences if present
+    content = content.strip().removeprefix("```json").removesuffix("```").strip()
+    try:
+        data = json.loads(content)
+        # Filter to only allowed urls (paranoia) and in same order as verified_urls
+        allowed = set(verified_urls)
+        data = [row for row in data if isinstance(row, dict) and row.get("url") in allowed]
+        # Sort to match verified_urls order
+        order = {u: i for i, u in enumerate(verified_urls)}
+        data.sort(key=lambda r: order.get(r["url"], 1e9))
+        return data
+    except Exception:
+        return []
+
+def render_resource_table(rows: list[dict]) -> str:
+    if not rows:
+        return "_No verified resources were available._"
+
+    header = "| Title | Type | Year | Access Type | Why it aligns | Suggested Use | URL |\n"
+    header += "|-------|------|------|------------|---------------|---------------|-----|\n"
+    lines = []
+    for r in rows:
+        title = r.get("title", "").replace("|", "｜")
+        typ = r.get("type", "")
+        year = r.get("year", "") or ""
+        acc = r.get("access", "")
+        why = r.get("why_aligns", "").replace("|", "｜")
+        use = r.get("use", "")
+        url = r.get("url", "")
+        lines.append(f"| {title} | {typ} | {year} | {acc} | {why} | {use} | [Link]({url}) |")
+    return header + "\n".join(lines)
 
 # ----------------------------
 # Run button (clean output by default; diagnostics optional)
@@ -227,46 +275,52 @@ if run:
 
     record_session_run()
 
-    # === 1) First generation ===
+    # === 1) Initial draft (A–D ideas + candidate sources embedded) ===
     with st.spinner("Generating draft and checking links…"):
-        draft_content = call_model(mlo, constraints)
+        messages = [
+            {"role": "system", "content": BASE_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Module-level objective (MLO): {mlo}\nOptional constraints: {constraints or 'None'}"}
+        ]
+        draft = call_model(messages, temperature)
 
-    # Diagnostics: show raw draft if requested
     if show_diag:
         with st.expander("Diagnostics: raw draft"):
-            st.markdown(draft_content)
+            st.markdown(draft)
 
-    # === 2) Verify URLs and retry if needed ===
-    urls = extract_urls(draft_content, cap=50)
+    # === 2) Extract + verify URLs from draft; retry to reach >=6 valid links ===
+    urls = extract_urls(draft, cap=60)
     results = [(u, *check_url(u)) for u in urls]
     good = [u for (u, ok, note) in results if ok]
-    bad = [(u, note) for (u, ok, note) in results if not ok]
 
     MAX_RETRIES = 2
-    attempt = 0
-    retry_chunks = []
+    attempts_text = []
+    content_for_context = draft
 
-    content_for_context = draft_content
+    attempt = 0
     while len(good) < 6 and attempt < MAX_RETRIES:
         attempt += 1
-        retry_chunk = call_model(mlo, constraints, prior_content=content_for_context + "\n\n" + RETRY_USER_INSTRUCTION)
-        retry_chunks.append((attempt, retry_chunk))
+        retry_messages = [
+            {"role": "system", "content": BASE_SYSTEM_PROMPT},
+            {"role": "assistant", "content": content_for_context},
+            {"role": "user", "content": RETRY_USER_INSTRUCTION}
+        ]
+        retry_chunk = call_model(retry_messages, temperature=0.2)
+        attempts_text.append((attempt, retry_chunk))
         content_for_context += "\n\n" + retry_chunk
 
-        urls_new = extract_urls(retry_chunk, cap=50)
+        urls_new = extract_urls(retry_chunk, cap=40)
         results_new = [(u, *check_url(u)) for u in urls_new]
         for (u, ok, _) in results_new:
             if ok and u not in good:
                 good.append(u)
 
-    # Diagnostics: show attempts + verification if requested
     if show_diag:
         with st.expander("Diagnostics: attempts & verification"):
-            for (i, chunk) in retry_chunks:
-                st.info(f"Attempt {i}: replacing broken/generic links and retrying sections E & G…")
+            for i, chunk in attempts_text:
+                st.info(f"Attempt {i}: replaced broken/generic links.")
                 st.markdown(chunk)
 
-            all_urls = extract_urls(content_for_context, cap=100)
+            all_urls = extract_urls(content_for_context, cap=120)
             final_results = [(u, *check_url(u)) for u in all_urls]
             good_final = [(u, note) for (u, ok, note) in final_results if ok]
             bad_final = [(u, note) for (u, ok, note) in final_results if not ok]
@@ -282,34 +336,38 @@ if run:
                 for url, note in bad_final:
                     st.write(f"❌ {note} — {url}")
 
-    # === 3) Rebuild a CLEAN Section E using only verified URLs ===
-    good_unique = list(dict.fromkeys(good))  # de-dupe, keep order
-    verified_summary_list = "\n".join(f"- {u}" for u in good_unique) if good_unique else "- (none)"
+    # === 3) Build Section E from verified URLs only (programmatic table) ===
+    good_unique = list(dict.fromkeys(good))
+    metadata_rows = build_metadata_json(good_unique)
+    section_e_table = render_resource_table(metadata_rows)
 
-    rebuild_instruction = f"""
-Rebuild ONLY section E (Resource Table) using EXACTLY and ONLY these verified URLs (use official titles/metadata if inferable; otherwise concise titles). Preserve the same Markdown table columns and formatting.
+    # === 4) Generate clean A–D and F (no links), and G (titles only) ===
+    clean_adf = call_model(
+        [
+            {"role": "system", "content": BASE_SYSTEM_PROMPT},
+            {"role": "assistant", "content": "We have a verified Resource Table (Section E) that will be shown separately. Remember: do not include any hyperlinks outside Section E."},
+            {"role": "user", "content": "Re-output sections A–D (concise) and F (Student Reading) only. In F, reference one item from Section E by title and provide a 50–80 word rationale. No hyperlinks."}
+        ],
+        temperature=0.2
+    )
 
-Verified URLs:
-{verified_summary_list}
-"""
-    clean_section_e = call_model(mlo, constraints, prior_content=rebuild_instruction)
+    clean_g = call_model(
+        [
+            {"role": "system", "content": BASE_SYSTEM_PROMPT},
+            {"role": "assistant", "content": "We will show Section E separately. Provide Optional Leads as titles plus domain names, no links."},
+            {"role": "user", "content": "Re-output ONLY section G (Optional Leads). If none are suitable, output exactly: 'No suitable paywalled leads found; open sources cover the scope.'"}
+        ],
+        temperature=0.2
+    )
 
-    # === 4) Rebuild sections A–D (short) and F; exclude E & G here ===
-    adf_instruction = "Re-output sections A–D (short) and F only. Do not include sections E or G."
-    clean_adf = call_model(mlo, constraints, prior_content=adf_instruction)
-
-    # === 5) Rebuild section G (Optional Leads) as required ===
-    leads_instruction = """
-Re-output ONLY section G (Optional Leads). If you cannot confidently name 2–3 paywalled/restricted items with short value notes, output exactly:
-"No suitable paywalled leads found; open sources cover the scope."
-"""
-    clean_section_g = call_model(mlo, constraints, prior_content=leads_instruction)
-
-    # === 6) Final clean presentation ===
+    # === 5) Present the final CLEAN output ===
     st.markdown("## Final Output")
     st.markdown(clean_adf)
-    st.markdown(clean_section_e)
-    st.markdown(clean_section_g)
+
+    st.markdown("### E. Resource Table (verified URLs only)")
+    st.markdown(section_e_table)
+
+    st.markdown(clean_g)
 
     if len(good_unique) < 6:
         st.warning(
