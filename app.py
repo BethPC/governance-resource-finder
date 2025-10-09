@@ -92,9 +92,9 @@ if len(mlo or "") > MAX_CHARS or len(constraints or "") > MAX_CHARS:
     st.stop()
 
 # ----------------------------
-# System prompt (Resources-first + Student Reading; Streamlit-optimized table + URL rules)
+# System prompt (Resources-first + Student Reading; table + URL rules)
 # ----------------------------
-SYSTEM_PROMPT = """
+BASE_SYSTEM_PROMPT = """
 You are Governance Resource Finder, an AI research assistant for instructional designers building courses on government, sustainability, smart cities, and digital living infrastructure. Your purpose is to find, vet, and summarize open or freely accessible learning resources—NOT to teach or explain the topic yourself.
 
 Terminology
@@ -118,10 +118,9 @@ Rules for Behavior
 - Default recency: 2019+ unless canonical.
 
 URL Reliability Rules:
-- Only include links that are likely valid and currently accessible (avoid 404s and generic homepages).
-- Link to the specific resource page when possible (not just the domain root).
-- Prefer direct links to PDFs or official report pages when available.
-- If you cannot provide a reliable specific link, write: “(no stable open URL; available via [Organization Name] publications)”.
+- Provide specific resource URLs (not just homepages). Prefer official report pages or direct open PDFs.
+- Do not fabricate paths. If you are not certain of a specific URL, write: “(no stable open URL; available via [Organization Name] publications)”.
+- Aim for at least 6–8 sources whose URLs are likely to resolve (no 404s).
 
 Output Format (Streamlit-optimized)
 A. Acknowledgement & Search Plan — one short line (keywords + domains).
@@ -135,10 +134,82 @@ E. Resource Table — render the main list as a Markdown table using embedded li
 | Example: Ofcom – Online Nation | Regulator report | 2023 | Freely accessible | Independent data on home device usage and streaming patterns | Pre-read | [Link](https://www.ofcom.org.uk/research-and-data/media-literacy-research/online-nation) |
 
 F. Student Reading (≤ 10 pages) — citation, URL (as Markdown link), access type, approx. length/page count, and a 50–80 word rationale explaining why it’s a clear, accessible introduction for non-specialists.
-G. Optional Leads (if applicable) — up to three restricted/paywalled items, each paired with a free/open substitute.
-
-Start by asking only for the MLO and any optional constraints (region, media types, recency window, exclusions). Then proceed.
+G. Optional Leads (paywalled or restricted) — provide 2–3 if available, each with a one-line note on value; if none exist, write a single line: “No suitable paywalled leads found; open sources cover the scope.”
 """
+
+# A helper instruction used only on retries:
+RETRY_USER_INSTRUCTION = """
+Some URLs above appear invalid or generic. Replace any broken or generic links with valid, specific URLs to the cited resources.
+Re-output ONLY sections:
+E. Resource Table
+G. Optional Leads (paywalled or restricted)
+Keep the exact table columns and the same Markdown formatting as before.
+Aim for a total of 6–8 working resource URLs in section E.
+"""
+
+# ----------------------------
+# Helpers: model call & link verification
+# ----------------------------
+def call_model(mlo_text: str, constraints_text: str, prior_content: str | None = None) -> str:
+    """Call the model. If prior_content is provided, this is a retry asking for replacements."""
+    api_key = os.environ.get("OPENAI_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+    if not api_key:
+        st.error("OPENAI_API_KEY not found. Add it in Streamlit Secrets.")
+        st.stop()
+    client = OpenAI(api_key=api_key)
+
+    messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
+    if prior_content:
+        messages.append({"role": "assistant", "content": prior_content})
+        messages.append({"role": "user", "content": RETRY_USER_INSTRUCTION})
+    else:
+        user_msg = f"Module-level objective (MLO): {mlo_text}\nOptional constraints: {constraints_text or 'None'}"
+        messages.append({"role": "user", "content": user_msg})
+
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        messages=messages
+    )
+    return resp.choices[0].message.content
+
+
+def extract_urls(markdown_text: str, cap: int = 50) -> list[str]:
+    raw_urls = set()
+    raw_urls.update(re.findall(r"https?://[^\s)>\]]+", markdown_text))
+    raw_urls.update(re.findall(r"\((https?://[^)]+)\)", markdown_text))
+    cleaned, seen = [], set()
+    for u in raw_urls:
+        u = u.strip().rstrip(".,);]")
+        try:
+            parsed = urlparse(u)
+            if not parsed.scheme.startswith("http"):
+                continue
+        except Exception:
+            continue
+        if u not in seen:
+            seen.add(u)
+            cleaned.append(u)
+        if len(cleaned) >= cap:
+            break
+    return cleaned
+
+
+def check_url(url: str, head_timeout=6, get_timeout=8) -> tuple[bool, str]:
+    """Return (ok, note), where ok=True means a likely good link."""
+    try:
+        r = requests.head(url, timeout=head_timeout, allow_redirects=True)
+        code = r.status_code
+        if code in (403, 405) or code >= 500:
+            r2 = requests.get(url, timeout=get_timeout, allow_redirects=True, stream=True)
+            code = r2.status_code
+        if 200 <= code < 300:
+            return True, f"{code}"
+        if 300 <= code < 400:
+            return True, f"{code} (redirect)"
+        return False, f"{code}"
+    except Exception as e:
+        return False, f"error: {e.__class__.__name__}"
 
 # ----------------------------
 # Run button
@@ -155,102 +226,61 @@ if run:
         st.warning("You’ve hit the session limit (15 runs/hour). Please try again later.")
         st.stop()
 
-    api_key = os.environ.get("OPENAI_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
-    if not api_key:
-        st.error("OPENAI_API_KEY not found. Add it in Streamlit Secrets.")
-        st.stop()
-
-    client = OpenAI(api_key=api_key)
-    user_msg = f"Module-level objective (MLO): {mlo}\nOptional constraints: {constraints or 'None'}"
-
-    with st.spinner("Searching open/freely accessible sources and drafting outputs…"):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                temperature=temperature,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg}
-                ]
-            )
-            content = resp.choices[0].message.content
-        except Exception as e:
-            st.error(f"Error from OpenAI: {e}")
-            st.stop()
-
-    # Count only successful runs
     record_session_run()
 
-    # Render the response
-    st.markdown(content)
+    # First attempt
+    with st.spinner("Generating draft and checking links…"):
+        content = call_model(mlo, constraints)
+        st.markdown(content)
+
+        urls = extract_urls(content, cap=50)
+        results = [(u, *check_url(u)) for u in urls]
+
+        good = [u for (u, ok, note) in results if ok]
+        bad = [(u, note) for (u, ok, note) in results if not ok]
+
+        # Retry loop: ask model to replace broken links and re-output the table/leads
+        MAX_RETRIES = 2
+        attempt = 0
+        while len(good) < 6 and attempt < MAX_RETRIES:
+            attempt += 1
+            st.info(f"Attempt {attempt}: replacing broken/generic links and retrying sections E & G…")
+            retry_content = call_model(mlo, constraints, prior_content=content)
+            # Show what changed
+            st.markdown(retry_content)
+
+            # Merge sections by simple concatenation (display-wise it’s fine)
+            content += "\n\n" + retry_content
+
+            # Re-verify with the combined text
+            urls = extract_urls(retry_content, cap=50)
+            results = [(u, *check_url(u)) for u in urls]
+            good.extend([u for (u, ok, note) in results if ok and u not in good])
+
+        # Final verification report
+        all_urls = extract_urls(content, cap=100)
+        final_results = [(u, *check_url(u)) for u in all_urls]
+        good_final = [(u, note) for (u, ok, note) in final_results if ok]
+        bad_final = [(u, note) for (u, ok, note) in final_results if not ok]
 
     # ----------------------------
-    # Link Verification Report (lightweight)
+    # Link Verification Report
     # ----------------------------
-    # Extract URLs from raw content: handles plain URLs and Markdown [text](url)
-    raw_urls = set()
-    # Plain URLs
-    raw_urls.update(re.findall(r"https?://[^\s)>\]]+", content))
-    # Markdown link targets
-    raw_urls.update(re.findall(r"\((https?://[^)]+)\)", content))
+    st.markdown("### 🔍 Link Verification Report")
+    st.caption("Checks whether each URL responds (HEAD with redirects, then GET fallback).")
+    if good_final:
+        st.success("Working:")
+        for url, note in good_final:
+            st.write(f"✅ {note} — {url}")
+    if bad_final:
+        st.error("Broken or blocked:")
+        for url, note in bad_final:
+            st.write(f"❌ {note} — {url}")
 
-    # Sanitize and dedupe (limit to a reasonable number to keep the app snappy)
-    cleaned_urls = []
-    seen = set()
-    for u in raw_urls:
-        # Trim trailing punctuation
-        u = u.strip().rstrip(".,);]")
-        # Skip obviously bad URLs
-        try:
-            parsed = urlparse(u)
-            if not parsed.scheme.startswith("http"):
-                continue
-        except Exception:
-            continue
-        if u not in seen:
-            seen.add(u)
-            cleaned_urls.append(u)
-        if len(cleaned_urls) >= 20:  # cap verification to 20 links per run
-            break
-
-    if cleaned_urls:
-        st.markdown("### 🔍 Link Verification Report")
-        st.caption("Checks whether each URL responds (HEAD with redirects, then GET fallback if needed).")
-        good, warn, bad = [], [], []
-
-        for url in cleaned_urls:
-            status = None
-            try:
-                # Some sites block HEAD; allow redirects
-                r = requests.head(url, timeout=6, allow_redirects=True)
-                status = r.status_code
-                # Fallback to GET if HEAD is not helpful (e.g., 405/403)
-                if status in (403, 405) or status >= 500:
-                    r2 = requests.get(url, timeout=8, allow_redirects=True, stream=True)
-                    status = r2.status_code
-            except Exception as e:
-                status = f"error: {e.__class__.__name__}"
-
-            if isinstance(status, int) and 200 <= status < 300:
-                good.append((url, status))
-            elif isinstance(status, int) and 300 <= status < 400:
-                warn.append((url, f"{status} (redirect)"))
-            elif isinstance(status, int):
-                bad.append((url, status))
-            else:
-                bad.append((url, status))
-
-        if good:
-            st.success("Working:")
-            for url, s in good:
-                st.write(f"✅ {s} — {url}")
-        if warn:
-            st.warning("Redirects (likely OK, verify content):")
-            for url, s in warn:
-                st.write(f"⚠️ {s} — {url}")
-        if bad:
-            st.error("Broken or blocked:")
-            for url, s in bad:
-                st.write(f"❌ {s} — {url}")
-
-        st.caption("Tip: If a link is broken, try the organization’s publications page and search the exact report title.")
+    # Explain if still short on valid links
+    valid_count = len({u for u, _ in good_final})
+    if valid_count < 6:
+        st.warning(
+            f"Only {valid_count} verified links were found after retries. "
+            "Consider narrowing the topic, relaxing recency, or allowing reputable media sources."
+        )
