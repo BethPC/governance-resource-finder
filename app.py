@@ -46,8 +46,8 @@ if not st.session_state.authed:
 # ----------------------------
 # Gentle per-session rate limit (15 runs per rolling hour)
 # ----------------------------
-WINDOW_SECONDS = 3600     # 1 hour
-MAX_RUNS_PER_WINDOW = 15  # per browser session
+WINDOW_SECONDS = 3600
+MAX_RUNS_PER_WINDOW = 15
 
 if "run_stamps" not in st.session_state:
     st.session_state.run_stamps = deque()
@@ -80,7 +80,7 @@ with st.sidebar:
 mlo = st.text_area(
     "Module-level objective (MLO)",
     height=140,
-    placeholder="e.g., Examine how digital living infrastructure enables 'cultural experiences from home' in future housing."
+    placeholder="e.g., Analyze how industrialization accelerated the growth of modern cities and identify resulting social/environmental problems."
 )
 constraints = st.text_area(
     "Optional constraints",
@@ -94,15 +94,18 @@ if len(mlo or "") > MAX_CHARS or len(constraints or "") > MAX_CHARS:
     st.stop()
 
 # ----------------------------
-# System prompt (resources-first; no links outside E)
+# System prompt (neutral; no links outside E; strict scope)
 # ----------------------------
 BASE_SYSTEM_PROMPT = """
-You are Governance Resource Finder, an AI research assistant for instructional designers building courses on government, sustainability, smart cities, and digital living infrastructure. Your purpose is to find, vet, and summarize open or freely accessible learning resources—NOT to teach or explain the topic yourself.
+You are Governance Resource Finder, an AI research assistant for instructional designers building courses on government and public policy, urbanization and city development, sustainability and environment, and related social-science topics. Your purpose is to find, vet, and summarize open or freely accessible learning resources—NOT to teach or explain the topic yourself.
 
 Terminology
 - Module-Level Learning Objective (MLO): a broad goal for a module.
 - Elemental Learning Objectives (ELOs): 2–4 specific, measurable outcomes that break the MLO into smaller parts; start with action verbs (Identify/Analyze/Evaluate…).
 - Student Reading: a short (≤ 10 pages) open or freely accessible article/brief for educated non-specialists that introduces the core concept.
+
+Hard rule on scope
+- All sections must strictly align to the user’s MLO. Do NOT substitute adjacent topics unless those exact terms appear in the MLO.
 
 Mission (resources-first)
 1) Search for open-licensed or freely accessible materials related to the MLO.
@@ -114,7 +117,7 @@ Mission (resources-first)
 Rules for Behavior
 - You are a librarian, not an instructor; never fulfill/teach the objective.
 - Every factual claim must come from cited materials.
-- Preferred domains (in order): .gov, .edu, .org; IGOs/NGOs (UN, World Bank, OECD, WHO, UN-Habitat); university OER portals; open datasets (Data.gov, OWID, World Bank Data, OECD Stats); reputable legacy media only if freely viewable.
+- Preferred domains (in order): .gov, .edu, .org; IGOs/NGOs (UN, World Bank, OECD, WHO, UN-Habitat); university OER portals; open datasets (Data.gov, Our World in Data, World Bank Data, OECD Stats); reputable legacy media only if freely viewable.
 - Prefer open-licensed or open access; accept freely accessible (no paywall) if reputable.
 - Include at least one dataset/visual and one applied case when possible.
 - Default recency: 2019+ unless canonical.
@@ -141,6 +144,15 @@ Some links look invalid or generic. Replace any broken or generic links with val
 Re-output ONLY the Resource Table (you may show it as a Markdown table) and the Optional Leads section.
 Aim for a total of 6–8 working resource URLs.
 """
+
+def scope_lock(mlo_text: str) -> dict:
+    return {
+        "role": "system",
+        "content": (
+            f"SCOPE LOCK: Work ONLY on this exact topic — {mlo_text}. "
+            f"Do not drift to adjacent topics unless they are explicitly in the MLO."
+        ),
+    }
 
 # ----------------------------
 # Helpers: model call & link verification
@@ -227,14 +239,11 @@ Verified URLs:
 {verified_list}
 """}]
     content = call_model(messages, temperature=0.1)
-    # Strip code fences if present
     content = content.strip().removeprefix("```json").removesuffix("```").strip()
     try:
         data = json.loads(content)
-        # Filter to only allowed urls (paranoia) and in same order as verified_urls
         allowed = set(verified_urls)
         data = [row for row in data if isinstance(row, dict) and row.get("url") in allowed]
-        # Sort to match verified_urls order
         order = {u: i for i, u in enumerate(verified_urls)}
         data.sort(key=lambda r: order.get(r["url"], 1e9))
         return data
@@ -244,7 +253,6 @@ Verified URLs:
 def render_resource_table(rows: list[dict]) -> str:
     if not rows:
         return "_No verified resources were available._"
-
     header = "| Title | Type | Year | Access Type | Why it aligns | Suggested Use | URL |\n"
     header += "|-------|------|------|------------|---------------|---------------|-----|\n"
     lines = []
@@ -279,6 +287,7 @@ if run:
     with st.spinner("Generating draft and checking links…"):
         messages = [
             {"role": "system", "content": BASE_SYSTEM_PROMPT},
+            scope_lock(mlo),
             {"role": "user", "content": f"Module-level objective (MLO): {mlo}\nOptional constraints: {constraints or 'None'}"}
         ]
         draft = call_model(messages, temperature)
@@ -301,6 +310,7 @@ if run:
         attempt += 1
         retry_messages = [
             {"role": "system", "content": BASE_SYSTEM_PROMPT},
+            scope_lock(mlo),
             {"role": "assistant", "content": content_for_context},
             {"role": "user", "content": RETRY_USER_INSTRUCTION}
         ]
@@ -345,6 +355,7 @@ if run:
     clean_adf = call_model(
         [
             {"role": "system", "content": BASE_SYSTEM_PROMPT},
+            scope_lock(mlo),
             {"role": "assistant", "content": "We have a verified Resource Table (Section E) that will be shown separately. Remember: do not include any hyperlinks outside Section E."},
             {"role": "user", "content": "Re-output sections A–D (concise) and F (Student Reading) only. In F, reference one item from Section E by title and provide a 50–80 word rationale. No hyperlinks."}
         ],
@@ -354,6 +365,7 @@ if run:
     clean_g = call_model(
         [
             {"role": "system", "content": BASE_SYSTEM_PROMPT},
+            scope_lock(mlo),
             {"role": "assistant", "content": "We will show Section E separately. Provide Optional Leads as titles plus domain names, no links."},
             {"role": "user", "content": "Re-output ONLY section G (Optional Leads). If none are suitable, output exactly: 'No suitable paywalled leads found; open sources cover the scope.'"}
         ],
