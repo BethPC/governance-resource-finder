@@ -17,15 +17,26 @@ st.title("📚 Governance Resource Finder (Open / Freely Accessible)")
 st.caption("Paste a module-level learning objective (MLO). Optionally add constraints (region, media type, recency, exclusions).")
 
 # ----------------------------
+# Session-state defaults
+# ----------------------------
+if "authed" not in st.session_state:
+    st.session_state.authed = False
+if "has_run" not in st.session_state:
+    st.session_state.has_run = False
+if "show_diag" not in st.session_state:
+    st.session_state.show_diag = False
+# diagnostics containers
+for key in ["diag_raw_draft", "diag_attempts", "diag_good_final", "diag_bad_final"]:
+    if key not in st.session_state:
+        st.session_state[key] = None
+
+# ----------------------------
 # Passcode gate (passcode must be in Streamlit Secrets)
 # ----------------------------
 EXPECTED_PASSCODE = st.secrets.get("APP_PASSCODE", None)
 if EXPECTED_PASSCODE is None:
     st.error("⚠️ APP_PASSCODE is not set in Streamlit Secrets. Add it in your app's Secrets.")
     st.stop()
-
-if "authed" not in st.session_state:
-    st.session_state.authed = False
 
 with st.sidebar:
     st.markdown("**Access**")
@@ -62,7 +73,7 @@ def record_session_run() -> None:
     st.session_state.run_stamps.append(time.time())
 
 # ----------------------------
-# Sidebar controls / tips
+# Sidebar controls / tips (no diagnostics toggle here)
 # ----------------------------
 with st.sidebar:
     st.markdown("**Tips**")
@@ -72,7 +83,6 @@ with st.sidebar:
     )
     temperature = st.slider("Creativity (lower = stricter)", 0.0, 1.0, 0.2, 0.1)
     model = st.selectbox("Model", ["gpt-4o", "gpt-4o-mini"], index=0)
-    show_diag = st.checkbox("Show diagnostics (attempts & broken links)", value=False)
 
 # ----------------------------
 # Inputs (neutral placeholders)
@@ -94,7 +104,7 @@ if len(mlo or "") > MAX_CHARS or len(constraints or "") > MAX_CHARS:
     st.stop()
 
 # ----------------------------
-# System prompt (neutral; strict scope; no links outside E)
+# System prompt (neutral; strict scope; no links outside E; 2010+)
 # ----------------------------
 BASE_SYSTEM_PROMPT = """
 You are Governance Resource Finder, an AI research assistant for instructional designers building courses on government and public policy, urbanization and city development, sustainability and environment, public administration, and related social-science topics. Your job is to find, vet, and summarize open or freely accessible learning resources—NOT to teach or fulfill the objective.
@@ -265,7 +275,7 @@ def render_resource_table(rows: list[dict]) -> str:
     return header + "\n".join(lines)
 
 # ----------------------------
-# Run button (clean output by default; diagnostics optional)
+# Run button
 # ----------------------------
 run = st.button("Find resources", type="primary")
 
@@ -289,9 +299,8 @@ if run:
         ]
         draft = call_model(messages, temperature)
 
-    if show_diag:
-        with st.expander("Diagnostics: raw draft"):
-            st.markdown(draft)
+    # Store for diagnostics
+    st.session_state.diag_raw_draft = draft
 
     # 2) Verify URLs; retry to reach >=6 valid links
     urls = extract_urls(draft, cap=60)
@@ -321,30 +330,15 @@ if run:
             if ok and u not in good:
                 good.append(u)
 
-    if show_diag:
-        with st.expander("Diagnostics: attempts & verification"):
-            for i, chunk in attempts_text:
-                st.info(f"Attempt {i}: replaced broken/generic links.")
-                st.markdown(chunk)
-
-            all_urls = extract_urls(content_for_context, cap=120)
-            final_results = [(u, *check_url(u)) for u in all_urls]
-            good_final = [(u, note) for (u, ok, note) in final_results if ok]
-            bad_final = [(u, note) for (u, ok, note) in final_results if not ok]
-
-            st.markdown("### 🔍 Link Verification Report")
-            st.caption("Checks whether each URL responds (HEAD with redirects, then GET fallback).")
-            if good_final:
-                st.success("Working:")
-                for url, note in good_final:
-                    st.write(f"✅ {note} — {url}")
-            if bad_final:
-                st.error("Broken or blocked:")
-                for url, note in bad_final:
-                    st.write(f"❌ {note} — {url}")
+    # Final verification report (store only; reveal later on demand)
+    all_urls = extract_urls(content_for_context, cap=120)
+    final_results = [(u, *check_url(u)) for u in all_urls]
+    st.session_state.diag_good_final = [(u, note) for (u, ok, note) in final_results if ok]
+    st.session_state.diag_bad_final = [(u, note) for (u, ok, note) in final_results if not ok]
+    st.session_state.diag_attempts = attempts_text
 
     # 3) Build Section E from verified URLs only (programmatic table)
-    good_unique = list(dict.fromkeys(good))
+    good_unique = list(dict.fromkeys([u for (u, _) in st.session_state.diag_good_final]))
     metadata_rows = build_metadata_json(good_unique)
     section_e_table = render_resource_table(metadata_rows)
 
@@ -369,7 +363,7 @@ if run:
         temperature=0.2
     )
 
-    # 5) Present final clean output
+    # Present final clean output
     st.markdown("## Final Output")
     st.markdown(clean_adf)
 
@@ -383,3 +377,43 @@ if run:
             f"Only {len(good_unique)} verified links were available. "
             "Consider narrowing the topic, relaxing constraints further, or allowing more media types."
         )
+
+    # Mark that we have a run; diagnostics can be revealed afterward
+    st.session_state.has_run = True
+
+# ----------------------------
+# Bottom-of-page Diagnostics toggle (works after a run)
+# ----------------------------
+if st.session_state.has_run:
+    if not st.session_state.show_diag:
+        if st.button("Show diagnostics (attempts & broken links)"):
+            st.session_state.show_diag = True
+            st.rerun()
+    else:
+        with st.expander("Diagnostics: raw draft"):
+            st.markdown(st.session_state.diag_raw_draft or "_(none)_")
+
+        with st.expander("Diagnostics: attempts & verification"):
+            if st.session_state.diag_attempts:
+                for i, chunk in st.session_state.diag_attempts:
+                    st.info(f"Attempt {i}: replaced broken/generic links.")
+                    st.markdown(chunk)
+            else:
+                st.write("_No retry attempts were necessary._")
+
+            st.markdown("### 🔍 Link Verification Report")
+            st.caption("Checks whether each URL responds (HEAD with redirects, then GET fallback).")
+            good_final = st.session_state.diag_good_final or []
+            bad_final = st.session_state.diag_bad_final or []
+            if good_final:
+                st.success("Working:")
+                for url, note in good_final:
+                    st.write(f"✅ {note} — {url}")
+            if bad_final:
+                st.error("Broken or blocked:")
+                for url, note in bad_final:
+                    st.write(f"❌ {note} — {url}")
+
+        if st.button("Hide diagnostics"):
+            st.session_state.show_diag = False
+            st.rerun()
