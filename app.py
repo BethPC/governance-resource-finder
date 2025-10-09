@@ -19,16 +19,24 @@ st.caption("Paste a module-level learning objective (MLO). Optionally add constr
 # ----------------------------
 # Session-state defaults
 # ----------------------------
-if "authed" not in st.session_state:
-    st.session_state.authed = False
-if "has_run" not in st.session_state:
-    st.session_state.has_run = False
-if "show_diag" not in st.session_state:
-    st.session_state.show_diag = False
-# diagnostics containers
-for key in ["diag_raw_draft", "diag_attempts", "diag_good_final", "diag_bad_final"]:
-    if key not in st.session_state:
-        st.session_state[key] = None
+defaults = {
+    "authed": False,
+    "has_run": False,
+    "show_diag": False,
+    # diagnostics stores
+    "diag_raw_draft": None,
+    "diag_attempts": None,
+    "diag_good_final": None,
+    "diag_bad_final": None,
+    # final report stores
+    "final_clean_adf": None,
+    "final_section_e_table": None,
+    "final_clean_g": None,
+    "final_good_count": 0,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # ----------------------------
 # Passcode gate (passcode must be in Streamlit Secrets)
@@ -59,7 +67,6 @@ if not st.session_state.authed:
 # ----------------------------
 WINDOW_SECONDS = 3600
 MAX_RUNS_PER_WINDOW = 15
-
 if "run_stamps" not in st.session_state:
     st.session_state.run_stamps = deque()
 
@@ -73,7 +80,7 @@ def record_session_run() -> None:
     st.session_state.run_stamps.append(time.time())
 
 # ----------------------------
-# Sidebar controls / tips (no diagnostics toggle here)
+# Sidebar controls / tips
 # ----------------------------
 with st.sidebar:
     st.markdown("**Tips**")
@@ -299,7 +306,7 @@ if run:
         ]
         draft = call_model(messages, temperature)
 
-    # Store for diagnostics
+    # Store draft for diagnostics
     st.session_state.diag_raw_draft = draft
 
     # 2) Verify URLs; retry to reach >=6 valid links
@@ -330,7 +337,7 @@ if run:
             if ok and u not in good:
                 good.append(u)
 
-    # Final verification report (store only; reveal later on demand)
+    # Final verification (store only; reveal later on demand)
     all_urls = extract_urls(content_for_context, cap=120)
     final_results = [(u, *check_url(u)) for u in all_urls]
     st.session_state.diag_good_final = [(u, note) for (u, ok, note) in final_results if ok]
@@ -352,7 +359,6 @@ if run:
         ],
         temperature=0.2
     )
-
     clean_g = call_model(
         [
             {"role": "system", "content": BASE_SYSTEM_PROMPT},
@@ -363,28 +369,33 @@ if run:
         temperature=0.2
     )
 
-    # Present final clean output
+    # ---- Persist final report to session so it survives later button clicks ----
+    st.session_state.final_clean_adf = clean_adf
+    st.session_state.final_section_e_table = section_e_table
+    st.session_state.final_clean_g = clean_g
+    st.session_state.final_good_count = len(good_unique)
+    st.session_state.has_run = True
+    st.session_state.show_diag = False  # start hidden after a fresh run
+
+# ----------------------------
+# Always render the latest FINAL REPORT first (if available)
+# ----------------------------
+if st.session_state.has_run:
     st.markdown("## Final Output")
-    st.markdown(clean_adf)
+    st.markdown(st.session_state.final_clean_adf or "_(no content)_")
 
     st.markdown("### E. Resource Table (verified URLs only)")
-    st.markdown(section_e_table)
+    st.markdown(st.session_state.final_section_e_table or "_(no table)_")
 
-    st.markdown(clean_g)
+    st.markdown(st.session_state.final_clean_g or "_(no optional leads)_")
 
-    if len(good_unique) < 6:
+    if (st.session_state.final_good_count or 0) < 6:
         st.warning(
-            f"Only {len(good_unique)} verified links were available. "
+            f"Only {st.session_state.final_good_count} verified links were available. "
             "Consider narrowing the topic, relaxing constraints further, or allowing more media types."
         )
 
-    # Mark that we have a run; diagnostics can be revealed afterward
-    st.session_state.has_run = True
-
-# ----------------------------
-# Bottom-of-page Diagnostics toggle (works after a run)
-# ----------------------------
-if st.session_state.has_run:
+    # Diagnostics controls below the report
     if not st.session_state.show_diag:
         if st.button("Show diagnostics (attempts & broken links)"):
             st.session_state.show_diag = True
@@ -394,8 +405,9 @@ if st.session_state.has_run:
             st.markdown(st.session_state.diag_raw_draft or "_(none)_")
 
         with st.expander("Diagnostics: attempts & verification"):
-            if st.session_state.diag_attempts:
-                for i, chunk in st.session_state.diag_attempts:
+            attempts = st.session_state.diag_attempts or []
+            if attempts:
+                for i, chunk in attempts:
                     st.info(f"Attempt {i}: replaced broken/generic links.")
                     st.markdown(chunk)
             else:
